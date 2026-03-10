@@ -57,9 +57,15 @@ nav:
           - RF-DETR Seg XLarge: reference/seg_xlarge.md
           - RF-DETR Seg 2XLarge: reference/seg_2xlarge.md
           - RF-DETR Seg Preview (Deprecated): reference/seg_preview.md
+      - Pose Estimation Models:
+          - RF-DETR Seg Nano: reference/pose_nano.md
+          - RF-DETR Seg Small: reference/pose_small.md
+          - RF-DETR Seg Medium: reference/pose_medium.md
+          - RF-DETR Seg Large: reference/pose_large.md
       - Training Configs:
           - Train Config: reference/train_config.md
           - Segmentation Train Config: reference/segmentation_train_config.md
+          - Pose Estimation Train Config: reference/pose_estimation_train_config.md
   - Tutorials: tutorials/index.md
   - Changelog: https://github.com/roboflow/rf-detr/releases
 

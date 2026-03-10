@@ -1,8 +1,8 @@
 # Train an RF-DETR Model
 
-You can train RF-DETR object detection and segmentation models on a custom dataset using the `rfdetr` Python package, or in the cloud using Roboflow.
+You can train RF-DETR object detection, segmentation, and pose estimation models on a custom dataset using the `rfdetr` Python package, or in the cloud using Roboflow.
 
-This guide describes how to train both an object detection and segmentation RF-DETR model.
+This guide describes how to train object detection, segmentation, and pose estimation RF-DETR models.
 
 ## Quick Start
 
@@ -39,6 +39,55 @@ RF-DETR supports training on datasets in both **COCO** and **YOLO** formats. The
         grad_accum_steps=4,
         lr=1e-4,
         output_dir="<OUTPUT_PATH>",
+    )
+    ```
+
+=== "Pose Estimation"
+
+    RF-DETR Pose is available in multiple sizes. Choose based on your speed/accuracy needs:
+
+    | Model | Resolution | Speed | Import |
+    |-------|------------|-------|--------|
+    | Nano | 384 | Fastest | `RFDETRPoseNano` |
+    | Small | 512 | Fast | `RFDETRPoseSmall` |
+    | Medium | 576 | Medium | `RFDETRPoseMedium` |
+    | Large | 768 | Slow | `RFDETRPoseLarge` |
+
+    ```python
+    from rfdetr import RFDETRPoseNano  # or RFDETRPoseSmall, RFDETRPoseMedium, RFDETRPoseLarge
+
+    model = RFDETRPoseNano(
+        num_keypoints=17,  # Number of keypoints to detect
+    )
+
+    model.train(
+        dataset_dir=<DATASET_PATH>,
+        epochs=100,
+        batch_size=4,
+        grad_accum_steps=4,
+        lr=1e-4,
+        output_dir=<OUTPUT_PATH>,
+    )
+    ```
+
+    For custom keypoints (e.g., 2 keypoints for start/end points):
+
+    ```python
+    from rfdetr import RFDETRPoseNano
+
+    model = RFDETRPoseNano(
+        num_keypoints=2,
+        keypoint_names=["start", "end"],
+        skeleton=[[0, 1]],  # Connect start to end
+    )
+
+    model.train(
+        dataset_dir=<DATASET_PATH>,
+        epochs=100,
+        batch_size=4,
+        grad_accum_steps=4,
+        lr=1e-4,
+        output_dir=<OUTPUT_PATH>,
     )
     ```
 
@@ -130,6 +179,24 @@ During training, multiple model checkpoints are saved to the output directory:
     model = RFDETRSegMedium(pretrain_weights="<CHECKPOINT_PATH>")
 
     detections = model.predict("<IMAGE_PATH>")
+    ```
+
+== "Pose Estimation"
+
+    ```python
+    from rfdetr import RFDETRPoseNano  # Use the same size as original training
+
+    model = RFDETRPoseNano(num_keypoints=2)  # Match your keypoint config
+
+    model.train(
+        dataset_dir=<DATASET_PATH>,
+        epochs=100,
+        batch_size=4,
+        grad_accum_steps=4,
+        lr=1e-4,
+        output_dir=<OUTPUT_PATH>,
+        resume=<CHECKPOINT_PATH>
+    )
     ```
 
 ## Next Steps
