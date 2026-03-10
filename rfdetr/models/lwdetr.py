@@ -36,6 +36,7 @@ from rfdetr.models.segmentation_head import (
     get_uncertain_point_coords_with_randomness,
     point_sample,
 )
+from rfdetr.models.keypoint_head import KeypointHead
 from rfdetr.models.transformer import build_transformer
 from rfdetr.util import box_ops
 from rfdetr.util.misc import (
@@ -55,6 +56,7 @@ class LWDETR(nn.Module):
         backbone,
         transformer,
         segmentation_head,
+        keypoint_head,
         num_classes,
         num_queries,
         aux_loss=False,
@@ -67,6 +69,8 @@ class LWDETR(nn.Module):
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
             transformer: torch module of the transformer architecture. See transformer.py
+            segmentation_head: optional segmentation head for instance masks
+            keypoint_head: optional keypoint head for pose estimation
             num_classes: number of object classes
             num_queries: number of object queries, ie detection slot. This is the maximal number of objects
                          Conditional DETR can detect in a single image. For COCO, we recommend 100 queries.
@@ -81,6 +85,7 @@ class LWDETR(nn.Module):
         self.class_embed = nn.Linear(hidden_dim, num_classes)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
         self.segmentation_head = segmentation_head
+        self.keypoint_head = keypoint_head
 
         query_dim = 4
         self.refpoint_embed = nn.Embedding(num_queries * group_detr, query_dim)
@@ -200,14 +205,20 @@ class LWDETR(nn.Module):
             if self.segmentation_head is not None:
                 outputs_masks = seg_head_fwd(features[0].tensors, hs, samples.tensors.shape[-2:])
 
+            # Keypoint prediction: outputs (x, y, visibility) for each keypoint
+            if self.keypoint_head is not None:
+                outputs_keypoints = self.keypoint_head(hs, reference_boxes=outputs_coord[-1])
+
             out = {"pred_logits": outputs_class[-1], "pred_boxes": outputs_coord[-1]}
             if self.segmentation_head is not None:
                 out["pred_masks"] = outputs_masks[-1]
+            if self.keypoint_head is not None:
+                out['pred_keypoints'] = outputs_keypoints[-1]
             if self.aux_loss:
-                out["aux_outputs"] = self._set_aux_loss(
-                    outputs_class,
-                    outputs_coord,
+                out['aux_outputs'] = self._set_aux_loss(
+                    outputs_class, outputs_coord,
                     outputs_masks if self.segmentation_head is not None else None,
+                    outputs_keypoints if self.keypoint_head is not None else None
                 )
 
         if self.two_stage:
@@ -252,6 +263,7 @@ class LWDETR(nn.Module):
         )
 
         outputs_masks = None
+        outputs_keypoints = None
 
         if hs is not None:
             if self.bbox_reparam:
@@ -270,6 +282,11 @@ class LWDETR(nn.Module):
                     ],
                     tensors.shape[-2:],
                 )[0]
+            if self.keypoint_head is not None:
+                outputs_keypoints = self.keypoint_head(
+                    [hs[-1]], 
+                    reference_boxes=outputs_coord[-1]
+                )[0]
         else:
             assert self.two_stage, "if not using decoder, two_stage must be True"
             outputs_class = self.transformer.enc_out_class_embed[0](hs_enc)
@@ -283,25 +300,39 @@ class LWDETR(nn.Module):
                     tensors.shape[-2:],
                     skip_blocks=True,
                 )[0]
+            if self.keypoint_head is not None:
+                outputs_keypoints = self.keypoint_head(
+                    [hs_enc], 
+                    reference_boxes=ref_enc
+                )[0]
 
+        # Return based on which heads are active
+        results = [outputs_coord, outputs_class]
         if outputs_masks is not None:
-            return outputs_coord, outputs_class, outputs_masks
-        else:
-            return outputs_coord, outputs_class
+            results.append(outputs_masks)
+        if outputs_keypoints is not None:
+            results.append(outputs_keypoints)
+
+        return tuple(results)
 
     @torch.jit.unused
-    def _set_aux_loss(self, outputs_class, outputs_coord, outputs_masks):
+    def _set_aux_loss(self, outputs_class, outputs_coord, outputs_masks, outputs_keypoints=None):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
-        if outputs_masks is not None:
-            return [
-                {"pred_logits": a, "pred_boxes": b, "pred_masks": c}
-                for a, b, c in zip(outputs_class[:-1], outputs_coord[:-1], outputs_masks[:-1])
-            ]
-        else:
-            return [{"pred_logits": a, "pred_boxes": b} for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
-
+        aux_outputs = []
+        for i in range(len(outputs_class) - 1):
+            aux_dict = {
+                'pred_logits': outputs_class[i],
+                'pred_boxes': outputs_coord[i]
+            }
+            if outputs_masks is not None:
+                aux_dict['pred_masks'] = outputs_masks[i]
+            if outputs_keypoints is not None:
+                aux_dict['pred_keypoints'] = outputs_keypoints[i]
+            aux_outputs.append(aux_dict)
+        return aux_outputs
+    
     def _get_backbone_encoder_layers(self) -> Optional[nn.ModuleList]:
         """Resolve the list of transformer blocks/layers from backbone[0].encoder.
 
@@ -669,6 +700,129 @@ class SetCriterion(nn.Module):
         del src_masks
         del target_masks
         return losses
+    
+    def loss_keypoints(self, outputs, targets, indices, num_boxes):
+        """Compute keypoint losses: L1 for coordinates, BCE for visibility, and OKS loss.
+        Expects outputs to contain 'pred_keypoints' of shape [B, Q, K, 3]
+        where K is num_keypoints and 3 is (x, y, visibility_logit).
+        Targets must have 'keypoints' key with shape [N, K, 3] where visibility is 0/1/2.
+        """
+        # Skip keypoint loss for encoder outputs (two-stage) which don't have keypoint predictions
+        if 'pred_keypoints' not in outputs:
+            device = outputs['pred_logits'].device
+            return {
+                'loss_keypoints_l1': torch.tensor(0.0, device=device),
+                'loss_keypoints_vis': torch.tensor(0.0, device=device),
+                'loss_keypoints_oks': torch.tensor(0.0, device=device),
+            }
+
+        idx = self._get_src_permutation_idx(indices)
+        src_keypoints = outputs['pred_keypoints'][idx]  # [N, K, 3]
+
+        # Handle no matches
+        if src_keypoints.numel() == 0:
+            device = outputs['pred_keypoints'].device
+            return {
+                'loss_keypoints_l1': torch.tensor(0.0, device=device),
+                'loss_keypoints_vis': torch.tensor(0.0, device=device),
+                'loss_keypoints_oks': torch.tensor(0.0, device=device),
+            }
+
+        # Gather target keypoints - skip if any target is missing keypoints
+        if not all('keypoints' in t for t in targets):
+            device = outputs['pred_keypoints'].device
+            return {
+                'loss_keypoints_l1': torch.tensor(0.0, device=device),
+                'loss_keypoints_vis': torch.tensor(0.0, device=device),
+                'loss_keypoints_oks': torch.tensor(0.0, device=device),
+            }
+
+        target_keypoints = torch.cat([
+            t['keypoints'][j] for t, (_, j) in zip(targets, indices)
+        ], dim=0)  # [N, K, 3]
+
+        # Separate coordinates and visibility
+        src_coords = src_keypoints[..., :2]  # [N, K, 2]
+        src_vis_logits = src_keypoints[..., 2]  # [N, K]
+
+        target_coords = target_keypoints[..., :2]  # [N, K, 2]
+        target_vis = target_keypoints[..., 2]  # [N, K] values 0/1/2
+
+        # Create mask for valid keypoints (visibility > 0)
+        valid_mask = target_vis > 0  # [N, K]
+
+        # L1 loss for coordinates (only for visible keypoints)
+        if valid_mask.any():
+            coord_loss = F.l1_loss(
+                src_coords[valid_mask],
+                target_coords[valid_mask],
+                reduction='sum'
+            ) / (valid_mask.sum() + 1e-6)
+        else:
+            coord_loss = src_coords.sum() * 0
+
+        # BCE loss for visibility
+        # Convert target visibility: 0->0 (not labeled), 1->0 (not visible), 2->1 (visible)
+        target_vis_binary = (target_vis == 2).float()
+        vis_loss = F.binary_cross_entropy_with_logits(
+            src_vis_logits, target_vis_binary, reduction='mean'
+        )
+
+        # OKS loss (Object Keypoint Similarity)
+        oks_loss = self._compute_oks_loss(
+            src_coords, target_coords, valid_mask, targets, indices
+        )
+
+        return {
+            'loss_keypoints_l1': coord_loss,
+            'loss_keypoints_vis': vis_loss,
+            'loss_keypoints_oks': oks_loss,
+        }
+
+    def _compute_oks_loss(self, src_coords, target_coords, valid_mask, targets, indices):
+        """Compute OKS-based loss similar to COCO evaluation metric.
+        OKS = exp(-d^2 / (2 * s^2 * k^2))
+        where d is distance, s is object scale, k is per-keypoint constant
+        """
+        device = src_coords.device
+
+        # COCO keypoint sigmas (controls the falloff per keypoint type)
+        # Pad to match num_keypoints if needed
+        coco_sigmas = torch.tensor([
+            0.026, 0.025, 0.025, 0.035, 0.035, 0.079, 0.079, 0.072, 0.072,
+            0.062, 0.062, 0.107, 0.107, 0.087, 0.087, 0.089, 0.089
+        ], device=device)
+
+        num_keypoints = src_coords.shape[1]
+        if num_keypoints > len(coco_sigmas):
+            # Extend with default sigma for extra keypoints
+            extra_sigmas = torch.full((num_keypoints - len(coco_sigmas),), 0.05, device=device)
+            sigmas = torch.cat([coco_sigmas, extra_sigmas])
+        else:
+            sigmas = coco_sigmas[:num_keypoints]
+
+        # Get bounding box areas for scale
+        target_boxes = torch.cat([
+            t['boxes'][j] for t, (_, j) in zip(targets, indices)
+        ], dim=0)  # [N, 4] in cxcywh format
+
+        areas = target_boxes[:, 2] * target_boxes[:, 3]  # w * h
+        scales = areas.sqrt()  # [N]
+
+        # Compute squared distances
+        dists = ((src_coords - target_coords) ** 2).sum(dim=-1)  # [N, K]
+
+        # Compute OKS per keypoint
+        k_squared = (2 * sigmas) ** 2
+        oks = torch.exp(-dists / (2 * scales.unsqueeze(-1) ** 2 * k_squared.unsqueeze(0) + 1e-6))
+
+        # Apply mask and compute loss (1 - mean OKS)
+        oks_masked = oks * valid_mask.float()
+        num_valid = valid_mask.float().sum(dim=-1).clamp(min=1)
+        oks_per_instance = oks_masked.sum(dim=-1) / num_valid
+
+        oks_loss = 1 - oks_per_instance.mean()
+        return oks_loss
 
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices
@@ -688,6 +842,7 @@ class SetCriterion(nn.Module):
             "cardinality": self.loss_cardinality,
             "boxes": self.loss_boxes,
             "masks": self.loss_masks,
+            'keypoints': self.loss_keypoints,
         }
         assert loss in loss_map, f"do you really want to compute {loss} loss?"
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
@@ -864,6 +1019,7 @@ class PostProcess(nn.Module):
         """
         out_logits, out_bbox = outputs["pred_logits"], outputs["pred_boxes"]
         out_masks = outputs.get("pred_masks", None)
+        out_keypoints = outputs.get('pred_keypoints', None)
 
         assert len(out_logits) == len(target_sizes)
         assert target_sizes.shape[1] == 2
@@ -883,16 +1039,18 @@ class PostProcess(nn.Module):
 
         # Optionally gather masks corresponding to the same top-K queries and resize to original size
         results = []
-        if out_masks is not None:
-            for i in range(out_masks.shape[0]):
-                res_i = {"scores": scores[i], "labels": labels[i], "boxes": boxes[i]}
-                k_idx = topk_boxes[i]
+        for i in range(out_logits.shape[0]):
+            res_i = {'scores': scores[i], 'labels': labels[i], 'boxes': boxes[i]}
+            k_idx = topk_boxes[i]
+            h, w = target_sizes[i].tolist()
+
+            # Optionally gather masks corresponding to the same top-K queries
+            if out_masks is not None:
                 masks_i = torch.gather(
                     out_masks[i],
                     0,
                     k_idx.unsqueeze(-1).unsqueeze(-1).repeat(1, out_masks.shape[-2], out_masks.shape[-1]),
                 )  # [K, Hm, Wm]
-                h, w = target_sizes[i].tolist()
                 masks_i = F.interpolate(
                     masks_i.unsqueeze(1),
                     size=(int(h), int(w)),
@@ -900,9 +1058,30 @@ class PostProcess(nn.Module):
                     align_corners=False,
                 )  # [K,1,H,W]
                 res_i["masks"] = masks_i > 0.0
-                results.append(res_i)
-        else:
-            results = [{"scores": s, "labels": l, "boxes": b} for s, l, b in zip(scores, labels, boxes)]
+                # Optionally gather keypoints and scale to pixel coordinates
+            if out_keypoints is not None:
+                num_keypoints = out_keypoints.shape[2]
+                # Gather keypoints for top-K queries: [K, num_keypoints, 3]
+                kpts_i = torch.gather(
+                    out_keypoints[i], 0,
+                    k_idx.unsqueeze(-1).unsqueeze(-1).repeat(1, num_keypoints, 3)
+                )
+
+                # Scale coordinates from [0,1] to pixel space
+                kpts_i_scaled = kpts_i.clone()
+                kpts_i_scaled[..., 0] = kpts_i[..., 0] * w  # x
+                kpts_i_scaled[..., 1] = kpts_i[..., 1] * h  # y
+                # Convert visibility logits to confidence scores via sigmoid
+                vis_conf = kpts_i[..., 2].sigmoid()
+                # For COCO evaluation: 2 = visible, 1 = occluded, 0 = not labeled
+                # We output 2 if confident (>0.5), else 0
+                kpts_i_scaled[..., 2] = (vis_conf > 0.5).float() * 2
+
+                res_i['keypoints'] = kpts_i_scaled
+                # Also store raw visibility confidence for user access
+                res_i['keypoints_confidence'] = vis_conf
+
+            results.append(res_i)
 
         return results
 
@@ -980,10 +1159,20 @@ def build_model(args):
         else None
     )
 
+    keypoint_head = (
+        KeypointHead(
+            hidden_dim=args.hidden_dim,
+            num_keypoints=args.num_keypoints,
+        )
+        if args.keypoint_head
+        else None
+    )
+
     model = LWDETR(
         backbone,
         transformer,
         segmentation_head,
+        keypoint_head,
         num_classes=num_classes,
         num_queries=args.num_queries,
         aux_loss=args.aux_loss,
@@ -1003,6 +1192,11 @@ def build_criterion_and_postprocessors(args):
     if args.segmentation_head:
         weight_dict["loss_mask_ce"] = args.mask_ce_loss_coef
         weight_dict["loss_mask_dice"] = args.mask_dice_loss_coef
+    if args.keypoint_head:
+        weight_dict['loss_keypoints_l1'] = args.keypoint_loss_coef
+        weight_dict['loss_keypoints_vis'] = args.keypoint_visibility_loss_coef
+        weight_dict['loss_keypoints_oks'] = args.keypoint_oks_loss_coef
+
     # TODO this is a hack
     if args.aux_loss:
         aux_weight_dict = {}
@@ -1015,6 +1209,8 @@ def build_criterion_and_postprocessors(args):
     losses = ["labels", "boxes", "cardinality"]
     if args.segmentation_head:
         losses.append("masks")
+    if args.keypoint_head:
+        losses.append('keypoints')
 
     sum_group_losses = getattr(args, "sum_group_losses", False)
     if args.segmentation_head:
