@@ -240,15 +240,26 @@ class LWDETR(nn.Module):
                     samples.tensors.shape[-2:],
                     skip_blocks=True,
                 )[0]
+            if self.keypoint_head is not None:
+                keypoints_enc = self.keypoint_head(
+                    [
+                        hs_enc,
+                    ],
+                    reference_boxes=outputs_coord[-1]
+                )[0]
 
             if hs is not None:
                 out["enc_outputs"] = {"pred_logits": cls_enc, "pred_boxes": ref_enc}
                 if self.segmentation_head is not None:
                     out["enc_outputs"]["pred_masks"] = masks_enc
+                if self.keypoint_head is not None:
+                    out["enc_outputs"]["pred_keypoints"] = keypoints_enc
             else:
                 out = {"pred_logits": cls_enc, "pred_boxes": ref_enc}
                 if self.segmentation_head is not None:
                     out["pred_masks"] = masks_enc
+                if self.keypoint_head is not None:
+                    out["pred_keypoints"] = keypoints_enc
 
         return out
 
@@ -275,36 +286,17 @@ class LWDETR(nn.Module):
                 outputs_coord = (self.bbox_embed(hs) + ref_unsigmoid).sigmoid()
             outputs_class = self.class_embed(hs)
             if self.segmentation_head is not None:
-                outputs_masks = self.segmentation_head(
-                    srcs[0],
-                    [
-                        hs,
-                    ],
-                    tensors.shape[-2:],
-                )[0]
+                outputs_masks = self.segmentation_head(srcs[0], [hs,], tensors.shape[-2:])[0]
             if self.keypoint_head is not None:
-                outputs_keypoints = self.keypoint_head(
-                    [hs[-1]], 
-                    reference_boxes=outputs_coord[-1]
-                )[0]
+                outputs_keypoints = self.keypoint_head([hs,], reference_boxes=outputs_coord[-1])[0]
         else:
             assert self.two_stage, "if not using decoder, two_stage must be True"
             outputs_class = self.transformer.enc_out_class_embed[0](hs_enc)
             outputs_coord = ref_enc
             if self.segmentation_head is not None:
-                outputs_masks = self.segmentation_head(
-                    srcs[0],
-                    [
-                        hs_enc,
-                    ],
-                    tensors.shape[-2:],
-                    skip_blocks=True,
-                )[0]
+                outputs_masks = self.segmentation_head(srcs[0], [hs_enc,], tensors.shape[-2:], skip_blocks=True)[0]
             if self.keypoint_head is not None:
-                outputs_keypoints = self.keypoint_head(
-                    [hs_enc], 
-                    reference_boxes=ref_enc
-                )[0]
+                outputs_keypoints = self.keypoint_head([hs_enc,], reference_boxes=ref_enc)[0]
 
         # Return based on which heads are active
         results = [outputs_coord, outputs_class]
@@ -1058,7 +1050,8 @@ class PostProcess(nn.Module):
                     align_corners=False,
                 )  # [K,1,H,W]
                 res_i["masks"] = masks_i > 0.0
-                # Optionally gather keypoints and scale to pixel coordinates
+
+            # Optionally gather keypoints and scale to pixel coordinates
             if out_keypoints is not None:
                 num_keypoints = out_keypoints.shape[2]
                 # Gather keypoints for top-K queries: [K, num_keypoints, 3]

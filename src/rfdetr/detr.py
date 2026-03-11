@@ -507,7 +507,12 @@ class RFDETR:
                 }
                 if len(predictions) == 3:
                     return_predictions["pred_masks"] = predictions[2]
+                elif len(predictions) == 4:
+                    return_predictions["pred_masks"] = predictions[2]
+                    return_predictions["pred_keypoints"] = predictions[3]
+                
                 predictions = return_predictions
+
             target_sizes = torch.tensor(orig_sizes, device=self.model.device)
             results = self.model.postprocess(predictions, target_sizes=target_sizes)
 
@@ -540,13 +545,13 @@ class RFDETR:
                 keypoints = result["keypoints"]
                 keypoints = keypoints[keep]
                 # Store keypoints in the data dict: [N, K, 3] where 3 = (x, y, visibility)
-                detections.data["keypoints"] = keypoints.cpu().numpy()
+                detections.keypoints = keypoints.cpu().numpy()
 
                 # Also copy keypoints_confidence (actual confidence scores 0.0-1.0)
                 if "keypoints_confidence" in result:
                     keypoints_conf = result["keypoints_confidence"]
                     keypoints_conf = keypoints_conf[keep]
-                    detections.data["keypoints_confidence"] = keypoints_conf.cpu().numpy()
+                    detections.keypoints_confidence = keypoints_conf.cpu().numpy()
 
             detections_list.append(detections)
 

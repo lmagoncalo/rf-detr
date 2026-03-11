@@ -274,7 +274,7 @@ class AlbumentationsWrapper:
                 keypoints_params=A.KeypointParams(
                     format="xy",
                     label_fields=["category_ids", "idxs"],  # Track labels and indices for per-instance field sync
-                    remove_invisible=False,  # Remove boxes with zero visibility/area after transformation
+                    remove_invisible=True,  # Remove boxes with zero visibility/area after transformation
                 ),
             )
         else:
