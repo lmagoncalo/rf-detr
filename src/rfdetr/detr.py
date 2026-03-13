@@ -506,10 +506,12 @@ class RFDETR:
                     "pred_boxes": predictions[0],
                 }
                 if len(predictions) == 3:
-                    return_predictions["pred_masks"] = predictions[2]
-                elif len(predictions) == 4:
-                    return_predictions["pred_masks"] = predictions[2]
-                    return_predictions["pred_keypoints"] = predictions[3]
+                    current_model = self.model.inference_model if self._is_optimized_for_inference else self.model.model
+                    
+                    if hasattr(current_model, "segmentation_head"):
+                        return_predictions["pred_masks"] = predictions[2]
+                    elif hasattr(current_model, "keypoint_head"):
+                        return_predictions["pred_keypoints"] = predictions[2]
                 
                 predictions = return_predictions
 

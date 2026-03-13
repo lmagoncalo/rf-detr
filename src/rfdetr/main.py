@@ -690,6 +690,8 @@ class Model:
             output_names = ["features"]
         elif self.args.segmentation_head:
             output_names = ["dets", "labels", "masks"]
+        elif self.args.keypoints_head:
+            output_names = ["dets", "labels", "keypoints"]
         else:
             output_names = ["dets", "labels"]
 
@@ -717,6 +719,25 @@ class Model:
                         f"{masks['spatial_features'].shape}, "
                         f"query_features: {masks['query_features'].shape}, "
                         f"bias: {masks['bias'].shape}"
+                    )
+            elif self.args.keypoints_head:
+                outputs = model(input_tensors)
+                dets = outputs["pred_boxes"]
+                labels = outputs["pred_logits"]
+                keypoints = outputs["pred_keypoints"]
+                if isinstance(keypoints, torch.Tensor):
+                    logger.debug(
+                        f"PyTorch inference output shapes - Boxes: {dets.shape}, Labels: {labels.shape}, "
+                        f"Keypoints: {keypoints.shape}"
+                    )
+                else:
+                    # keypoints is a dict with spatial_features, query_features, bias
+                    logger.debug(f"PyTorch inference output shapes - Boxes: {dets.shape}, Labels: {labels.shape}")
+                    logger.debug(
+                        "Keypoints spatial_features: "
+                        f"{keypoints['spatial_features'].shape}, "
+                        f"query_features: {keypoints['query_features'].shape}, "
+                        f"bias: {keypoints['bias'].shape}"
                     )
             else:
                 outputs = model(input_tensors)

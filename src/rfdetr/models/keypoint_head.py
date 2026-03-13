@@ -13,7 +13,7 @@ following YOLOv11's approach for pose estimation.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Optional
+from typing import List, Optional, Callable
 
 
 class MLP(nn.Module):
@@ -68,6 +68,8 @@ class KeypointHead(nn.Module):
 
         self._reset_parameters()
 
+        self._export = False
+
     def _reset_parameters(self):
         """Initialize weights for better convergence."""
         # Initialize coordinate head to predict center initially
@@ -77,6 +79,14 @@ class KeypointHead(nn.Module):
         # Initialize visibility head with slight negative bias (most keypoints start hidden)
         nn.init.zeros_(self.visibility_head.layers[-1].weight)
         nn.init.zeros_(self.visibility_head.layers[-1].bias)
+
+    def export(self):
+        self._export = True
+        self._forward_origin = self.forward
+        self.forward = self.forward_export
+        for name, m in self.named_modules():
+            if hasattr(m, "export") and isinstance(m.export, Callable) and hasattr(m, "_export") and not m._export:
+                m.export()
 
     def forward(
         self,
@@ -126,6 +136,45 @@ class KeypointHead(nn.Module):
             keypoint_outputs.append(keypoints)
 
         return keypoint_outputs
+    
+    def forward_export(
+        self,
+        query_features: List[torch.Tensor],
+        reference_boxes: Optional[torch.Tensor] = None,
+    ) -> List[torch.Tensor]:
+        """
+        Export-friendly forward.
+
+        Expects exactly one query feature tensor.
+        """
+
+        assert len(query_features) == 1, "export expects exactly one query feature"
+
+        qf = query_features[0]
+        B, N, _ = qf.shape
+
+        # Predict coordinates
+        coords = self.coord_head(qf)  # [B, N, num_keypoints * 2]
+        coords = coords.view(B, N, self.num_keypoints, 2)
+        coords = coords.sigmoid()
+
+        if reference_boxes is not None:
+            cx, cy, w, h = reference_boxes.unbind(-1)
+
+            kpt_x = cx.unsqueeze(-1) + (coords[..., 0] - 0.5) * w.unsqueeze(-1)
+            kpt_y = cy.unsqueeze(-1) + (coords[..., 1] - 0.5) * h.unsqueeze(-1)
+
+            coords = torch.stack([kpt_x, kpt_y], dim=-1)
+            coords = coords.clamp(0, 1)
+
+        # Predict visibility
+        vis = self.visibility_head(qf)  # [B, N, num_keypoints]
+        vis = vis.unsqueeze(-1)
+
+        # Combine outputs
+        keypoints = torch.cat([coords, vis], dim=-1)
+
+        return [keypoints]
 
 
 # COCO keypoint constants for reference
