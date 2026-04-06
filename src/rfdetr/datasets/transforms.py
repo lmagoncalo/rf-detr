@@ -261,8 +261,9 @@ class AlbumentationsWrapper:
         self._is_geometric = _is_geometric_transform(transform)
 
         if self._is_geometric:
-            # Wrap geometric transform with bbox handling capabilities
-            # bbox_params configure how Albumentations should transform bounding boxes:
+            # Wrap geometric transform with bbox and keypoint handling capabilities
+            # bbox_params configure how Albumentations should transform bounding boxes.
+            # keypoint_params configure how Albumentations should transform keypoints.
             self.transform = A.Compose(
                 [transform],
                 bbox_params=A.BboxParams(
@@ -271,10 +272,10 @@ class AlbumentationsWrapper:
                     min_visibility=0.0,  # Remove boxes with zero visibility/area after transformation
                     clip=True,  # Clip box coordinates to image boundaries after transformation
                 ),
-                keypoints_params=A.KeypointParams(
+                keypoint_params=A.KeypointParams(
                     format="xy",
-                    label_fields=["category_ids", "idxs"],  # Track labels and indices for per-instance field sync
-                    remove_invisible=True,  # Remove boxes with zero visibility/area after transformation
+                    # label_fields=["category_ids", "idxs"],
+                    remove_invisible=False,
                 ),
             )
         else:
@@ -407,13 +408,21 @@ class AlbumentationsWrapper:
             masks_list = [mask for mask in masks_np]
 
         keypoints_list = None
+        keypoints_vis = None
+        keypoints_channels = None
         if "keypoints" in target:
             keypoints = target["keypoints"]
             keypoints_np = keypoints.cpu().numpy() if torch.is_tensor(keypoints) else np.array(keypoints)
-            if keypoints_np.ndim != 3:
-                raise ValueError(f"keypoints must have shape (N, K, 2), got {keypoints_np.shape}")
-            keypoints_np = keypoints_np.astype(np.uint8, copy=False)
-            keypoints_list = [keypoints for keypoints in keypoints_np]
+            if keypoints_np.ndim != 3 or keypoints_np.shape[2] not in (2, 3):
+                raise ValueError(f"keypoints must have shape (N, K, 2) or (N, K, 3), got {keypoints_np.shape}")
+            keypoints_channels = keypoints_np.shape[2]
+            keypoints_xy = keypoints_np[..., :2].astype(np.float32, copy=False)
+            height, width = image_np.shape[:2]
+            keypoints_xy[..., 0] = keypoints_xy[..., 0] * width
+            keypoints_xy[..., 1] = keypoints_xy[..., 1] * height
+            if keypoints_channels == 3:
+                keypoints_vis = keypoints_np[..., 2]
+            keypoints_list = keypoints_xy.reshape(-1, 2).tolist()
 
         # Apply transform
         transform_kwargs = {"image": image_np, "bboxes": boxes_np, "category_ids": labels, "idxs": idxs}
@@ -425,6 +434,7 @@ class AlbumentationsWrapper:
         target_out: Dict[str, Any] = target.copy()
         bboxes_aug = augmented["bboxes"]
         kept_idxs = augmented.get("idxs", idxs)
+        kept_idxs = [int(kept_idx) for kept_idx in kept_idxs]
         # Update target with transformed boxes and labels
         if len(bboxes_aug) == 0:
             target_out["boxes"] = torch.zeros((0, 4), dtype=torch.float32)
@@ -457,11 +467,27 @@ class AlbumentationsWrapper:
         if keypoints_list is not None and "keypoints" in augmented:
             height, width = augmented["image"].shape[:2]
             keypoints_aug = augmented["keypoints"]
-            keypoints_aug = [keypoints_aug[int(i)] for i in kept_idxs]
+            num_keypoints = keypoints_np.shape[1]
+            keypoints_aug_filtered = []
+            for idx in kept_idxs:
+                start = int(idx * num_keypoints)
+                end = int(start + num_keypoints)
+                keypoints_aug_filtered.append(keypoints_aug[start:end])
+            keypoints_aug = keypoints_aug_filtered
             if len(keypoints_aug) == 0:
-                target_out["keypoints"] = torch.zeros((0, 17, 2), dtype=torch.bool)
+                channels = keypoints_channels or 2
+                target_out["keypoints"] = torch.zeros((0, num_keypoints, channels), dtype=torch.float32)
             else:
-                target_out["keypoints"] = torch.as_tensor(np.stack(keypoints_aug), dtype=torch.float32)
+                keypoints_aug_np = np.stack(keypoints_aug, axis=0).astype(np.float32)
+                keypoints_aug_np[..., 0] = keypoints_aug_np[..., 0] / width
+                keypoints_aug_np[..., 1] = keypoints_aug_np[..., 1] / height
+                np.clip(keypoints_aug_np[..., :2], 0.0, 1.0, out=keypoints_aug_np[..., :2])
+                if keypoints_channels == 3:
+                    keypoints_aug_np = np.concatenate(
+                        [keypoints_aug_np, keypoints_vis[kept_idxs][..., None]],
+                        axis=-1,
+                    )
+                target_out["keypoints"] = torch.as_tensor(keypoints_aug_np, dtype=torch.float32)
         
         return image_out, target_out
 
