@@ -15,3 +15,16 @@ dependencies = [
     "torchvision==0.23.0",
     "transformers<5.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/lmagoncalo/rf-detr"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["rfdetr*"]
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.package-data]
+rfdetr = ["py.typed", "models/backbone/dinov2_configs/*.json"]
